@@ -39,18 +39,16 @@ jupyterhub:
 
   ingress:
     ## Example ingress configuration
-    # enabled: true
-    # hosts:
-    #   - nbgrader.example.com
-    # tls:
-    #   - hosts:
-    #       - nbgrader.example.com
-    #     secretName: nbgrader-example-com-tls
-
-    enabled: false
-    annotations: {}
-    hosts: []
-    tls: []
+    enabled: true
+    hosts:
+      - krkoo-nbg.dyn.cloud.e-infra.cz
+    tls:
+      - hosts:
+          - krkoo-nbg.dyn.cloud.e-infra.cz
+        secretName: krkoo-nbg-dyn-cloud-e-infra-cz
+    annotations:
+      cert-manager.io/cluster-issuer: "letsencrypt-prod"
+      kubernetes.io/tls-acme: "true"
 
   hub:
     extraConfig:
@@ -269,12 +267,37 @@ jupyterhub:
             mount(spawner, hub_home_name + "-pv", hub_home_name, "/home/jovyan", "pvc")
 
         def set_resources(spawner):
-          spawner.cpu_limit = 2 
-          spawner.cpu_guarantee = 2
-          spawner.mem_limit = '4G'
-          spawner.mem_guarantee = '4G'
+          spawner.cpu_limit = 1 
+          spawner.cpu_guarantee = 1
+          spawner.mem_limit = '1G'
+          spawner.mem_guarantee = '1G'
           spawner.container_security_context = {"capabilities": {"drop": ["ALL"]}}
 
+        USER_COURSES_DIR = "/etc/jupyter/course_users"
+        def get_user_courses(user_id, user_type="student"):
+          courses = []
+          for filename in os.listdir(USER_COURSES_DIR):
+
+            if user_type == "student" and not filename.endswith("students.txt"):
+              continue
+
+            if user_type == "instructor" and not filename.endswith("instructors.txt"):
+              continue
+
+            with open(os.path.join(USER_COURSES_DIR, filename), "r") as f:
+              for line in f:
+                if line.strip() == user_id:
+                  courses.append(filename.split("_")[0])
+
+          return courses
+
+        def get_all_courses():
+          courses = set()
+          for filename in os.listdir(USER_COURSES_DIR):
+              courses.add(filename.split("_")[0])
+          return courses
+
+        from nbgrader.api import Gradebook
 
         async def bootstrap_pre_spawn(spawner):
           config.load_incluster_config()
@@ -288,19 +311,27 @@ jupyterhub:
 
           await mount_persistent_hub_home(spawner, username, namespace)
 
-          isStudent = True
           volume = {"name": "nbgrader-exchange", "persistentVolumeClaim": {"claimName": "nbgrader-exchange"}}
           add_volume(spawner.volumes, volume, volume["name"])
 
-          for group in groups:
-            if group.startswith("formgrade-"):
-              isStudent = False
-              courseName = group.replace("formgrade-", "")
+          isStudent = True
 
-              volume_mount = {"mountPath": f"/mnt/exchange", "name": "nbgrader-exchange"}
-              add_volume(spawner.volume_mounts, volume_mount, volume_mount["name"])
-            elif group.startswith("nbgrader-"):
-              courseName = group.replace("nbgrader-", "")
+          for courseName in get_user_courses(username, "instructor"):
+            isStudent = False
+            if not os.path.exists(f'/mnt/exchange/{courseName}'):
+              os.makedirs(f"/mnt/exchange/{courseName}")
+
+            spawner.volume_mounts.extend([{
+                "name": "nbgrader-exchange", 
+                "mountPath": f"/mnt/exchange/{courseName}",
+                "subPath": f"{courseName}",
+              }
+            ])
+
+          if isStudent:
+            for courseName in get_user_courses(username, "student"):
+              with Gradebook(f"sqlite:////mnt/exchange/{courseName}/gradebook.db") as gb:
+                gb.update_or_create_student(username)
 
               if not os.path.exists(f'/mnt/exchange/{courseName}/inbound/{username}'):
                 os.makedirs(f"/mnt/exchange/{courseName}/inbound/{username}")
@@ -340,7 +371,7 @@ jupyterhub:
 
         base_port = 9000
         idx = 0
-        for course, instructors in COURSES.items():
+        for course in get_all_courses():
           # "outbound" must exist before starting a singleuser 
           if not os.path.exists(f'/mnt/exchange/{course}/outbound'):
             os.makedirs(f"/mnt/exchange/{course}/outbound")
@@ -368,8 +399,7 @@ jupyterhub:
             }
           )
 
-          groupsToCreate[f"nbgrader-{course}"] = []
-          groupsToCreate[f"formgrade-{course}"] = instructors
+          groupsToCreate[f"formgrade-{course}"] = []
 
           c.JupyterHub.load_roles.append({
             "name": f"formgrade-{course}",
@@ -387,36 +417,80 @@ jupyterhub:
 
         c.JupyterHub.load_groups = groupsToCreate
 
-    config:
-      Authenticator:
-        # If any more admins, existing ones must set as admin in UI
-        # Changes will disappear if db disappears
-        admin_users:
-          - 'admin'
-        enable_auth_state: true
-        auto_login: False
-      NativeAuthenticator:
-        check_common_password: true
-        minimum_password_length: 8
-        ask_email_on_signup: true
-      JupyterHub:
-        authenticator_class: 'native'
-        # Allow servers do anything their owners can do
-        load_roles:
-          - name: 'server'
-            scopes:
-              - 'inherit'
+        c.Authenticator.admin_users = ["admin"]
+        c.Authenticator.enable_auth_state = True
+        c.Authenticator.auto_login = False
+
+        from nativeauthenticator import NativeAuthenticator
+        from jupyterhub.orm import Group, User
+
+        class CustomAuthenticator(NativeAuthenticator):
+          async def authenticate(self, handler, data):
+            username = await super().authenticate(handler, data)
+
+            if not username:
+              return None
+            
+            user = self.db.query(User).filter_by(name=username).one_or_none()
+            if user is None:
+              user = User(name=username)
+              self.db.add(user)
+              self.db.commit()
+
+            for course_name in get_user_courses(username, "instructor"):
+              group_name = f"formgrade-{course_name}"
+              group = self.db.query(Group).filter_by(name=group_name).one_or_none()
+
+              if group is None:
+                group = Group(name=group_name)
+                self.db.add(group)
+                self.db.commit()
+
+              if user not in group.users:
+                group.users.append(user)
+                self.db.commit()
+
+            return username
+
+        c.CustomAuthenticator.check_common_password = True
+        c.CustomAuthenticator.minimum_password_length = 8
+        c.CustomAuthenticator.ask_email_on_signup = True
+        c.JupyterHub.authenticator_class = CustomAuthenticator
+        c.JupyterHub.load_roles.append({
+          "name": "server",
+          "scopes": ["inherit"]
+        })
+
+    # config:
+    # Authenticator:
+    #   # If any more admins, existing ones must set as admin in UI
+    #   # Changes will disappear if db disappears
+    #   admin_users:
+    #     - 'admin'
+    #   enable_auth_state: true
+    #   auto_login: False
+    # NativeAuthenticator:
+    #   check_common_password: true
+    #   minimum_password_length: 8
+    #   ask_email_on_signup: true
+    # JupyterHub:
+    #   authenticator_class: 'native'
+    #   # Allow servers do anything their owners can do
+    #   load_roles:
+    #     - name: 'server'
+    #       scopes:
+    #         - 'inherit'
     image:
       name: cerit.io/hubs/nbgrader-hub
-      tag: '10-11-2023'
+      tag: "10-11-2023"
       pullPolicy: Always
     resources:
       requests:
-        memory: '4Gi'
-        cpu: '2000m'
+        memory: "4Gi"
+        cpu: "2000m"
       limits:
-        memory: '4Gi'
-        cpu: '2000m'
+        memory: "4Gi"
+        cpu: "2000m"
     livenessProbe:
       initialDelaySeconds: 10
       periodSeconds: 10
@@ -430,7 +504,7 @@ jupyterhub:
     db:
       # Select the storage class for the hub database
       pvc:
-        storageClassName: 'nfs-csi'
+        storageClassName: "nfs-csi"
     containerSecurityContext:
       allowPrivilegeEscalation: false
       runAsUser: 1000
@@ -447,9 +521,9 @@ jupyterhub:
     consecutiveFailureLimit: 0
     networkPolicy:
       enabled: false
-      interNamespaceAccessLabels: 'accept'
       egressAllowRules:
         cloudMetadataServer: false
+
     # Exchange dir mounted to hub pod to ensure student path creation
     extraVolumes:
       - name: nbgrader-exchange
@@ -460,17 +534,34 @@ jupyterhub:
           name: nbgrader-config-global
     extraVolumeMounts:
       - name: nbgrader-exchange
-        mountPath: '/mnt/exchange'
+        mountPath: "/mnt/exchange"
       - name: nbgrader-config-global
-        mountPath: '/etc/jupyter/'
+        subPath: "nbgrader_config.py"
+        mountPath: "/etc/jupyter/nbgrader_config.py"
+        readOnly: true
+      - name: nbgrader-config-global
+        subPath: "course1_students.txt"
+        mountPath: "/etc/jupyter/course_users/course1_students.txt"
+        readOnly: true
+      - name: nbgrader-config-global
+        subPath: "course1_instructors.txt"
+        mountPath: "/etc/jupyter/course_users/course1_instructors.txt"
+        readOnly: true
+      - name: nbgrader-config-global
+        subPath: "course2_students.txt"
+        mountPath: "/etc/jupyter/course_users/course2_students.txt"
+        readOnly: true
+      - name: nbgrader-config-global
+        subPath: "course2_instructors.txt"
+        mountPath: "/etc/jupyter/course_users/course2_instructors.txt"
         readOnly: true
 
   singleuser:
     networkPolicy:
-      enabled: false
+      enabled: true
     cloudMetadata:
       blockWithIptables: false
-    defaultUrl: '/lab'
+    defaultUrl: "/lab"
     storage:
       type: none
       extraVolumes:
@@ -479,7 +570,7 @@ jupyterhub:
             name: nbgrader-config-global
       extraVolumeMounts:
         - name: nbgrader-config-global
-          mountPath: '/etc/jupyter/'
+          mountPath: "/etc/jupyter/"
           readOnly: true
     cmd: jupyterhub-singleuser
     uid: 1000
@@ -496,8 +587,8 @@ jupyterhub:
       postStart:
         exec:
           command:
-            - 'bash'
-            - '-c'
+            - "bash"
+            - "-c"
             - >
               echo -e "envs_dirs:\n  - /home/jovyan/my-conda-envs/" > /home/jovyan/.condarc;
 

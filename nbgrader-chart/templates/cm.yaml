@@ -6,12 +6,34 @@ data:
   nbgrader_config.py: |
     import os
     from nbgrader.server_extensions.assignment_list.handlers import AssignmentList
-    from nbgrader.auth import Authenticator, JupyterHubAuthPlugin
+    from nbgrader.auth import Authenticator, JupyterHubAuthPlugin, BaseAuthPlugin
+
+    EXCHANGE_ROOT = "/mnt/exchange"
+
+    #-----------------
+    import requests
+    from typing import Optional
+
+    class CustomAuthPlugin(BaseAuthPlugin):
+        def get_student_courses(self, student_id: str) -> Optional[list]:
+            course_dirs = [ f.name for f in os.scandir(EXCHANGE_ROOT) if f.is_dir() ]
+
+            self.log.error("COURSES: ", course_dirs)
+
+            return course_dirs
+
+        def add_student_to_course(self, student_id: str, course_id: str) -> None:
+            pass
+
+        def remove_student_from_course(self, student_id: str, course_id: str) -> None:
+            pass
+
+    #-----------------
 
     c = get_config()
     c.Exchange.path_includes_course = True
-    c.Exchange.root = "/mnt/exchange"
-    c.Authenticator.plugin_class = JupyterHubAuthPlugin
+    c.Exchange.root = EXCHANGE_ROOT
+    c.Authenticator.plugin_class = CustomAuthPlugin
 
     # Use the custom k8s exchange
     c.ExchangeFactory.collect = 'nbgrader_k8s_exchange.plugin.ExchangeCollect'
@@ -26,6 +48,7 @@ data:
     # List courses for the student even if there are no assignments
     def list_courses(self):
         auth = Authenticator(config=c)
+        print("list_courses", auth)
 
         return {
           "success": True,
@@ -33,3 +56,18 @@ data:
         }
 
     AssignmentList.list_courses = list_courses
+
+  course1_students.txt: |
+    student1
+    student2
+    student3
+
+  course1_instructors.txt: |
+    instructor1
+    instructor2
+
+  course2_students.txt: |
+    student2
+
+  course2_instructors.txt: |
+    instructor2
