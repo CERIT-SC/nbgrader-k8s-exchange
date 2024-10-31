@@ -193,11 +193,25 @@ class ExchangeList(ABCExchangeList, Exchange):
             for key in assignment_keys:
                 submissions = [x for x in assignments if _match_key(x, key)]
                 submissions = sorted(submissions, key=lambda x: x['timestamp'])
+                
+                submisstions_with_feedback = [x for x in submissions if x['has_local_feedback']]
+                score, max_score = 0, 0
+                if len(submisstions_with_feedback) > 0 and submisstions_with_feedback[-1]['local_feedback_path'] is not None:
+                  score_regex = r"<h4>.* \(Score: (.*) \/ (.*)\)<\/h4>"
+                  with open(os.path.join(submisstions_with_feedback[-1]['local_feedback_path'], key[2] + ".html")) as f:
+                    for line in f:
+                      if re.match(score_regex, line):
+                        score = float(re.match(score_regex, line).group(1))
+                        max_score = float(re.match(score_regex, line).group(2))
+                        break
+
                 info = {
                     'course_id': key[0],
                     'student_id': key[1],
                     'assignment_id': key[2],
                     'status': submissions[0]['status'],
+                    'score': score,
+                    'max_score': max_score,
                     'submissions': submissions
                 }
                 assignment_submissions.append(info)
