@@ -14,6 +14,18 @@ def _checksum(path):
     return m.hexdigest()
 
 
+def get_score(html_data):
+    score_regex = r"<h4>.* \(Score: (.*) \/ (.*)\)<\/h4>"
+    matches = re.findall(score_regex, html_data, re.MULTILINE)
+    
+    if len(matches) == 0:
+        return None, None
+    
+    match = matches[0]
+    score = float(match[0])
+    max_score = float(match[1])
+    return score, max_score
+
 class ExchangeList(ABCExchangeList, Exchange):
 
     def init_src(self):
@@ -194,24 +206,30 @@ class ExchangeList(ABCExchangeList, Exchange):
                 submissions = [x for x in assignments if _match_key(x, key)]
                 submissions = sorted(submissions, key=lambda x: x['timestamp'])
                 
-                submisstions_with_feedback = [x for x in submissions if x['has_local_feedback']]
+                has_score = False
                 score, max_score = 0, 0
-                if len(submisstions_with_feedback) > 0 and submisstions_with_feedback[-1]['local_feedback_path'] is not None:
-                  score_regex = r"<h4>.* \(Score: (.*) \/ (.*)\)<\/h4>"
-                  with open(os.path.join(submisstions_with_feedback[-1]['local_feedback_path'], key[2] + ".html")) as f:
-                    for line in f:
-                      if re.match(score_regex, line):
-                        score = float(re.match(score_regex, line).group(1))
-                        max_score = float(re.match(score_regex, line).group(2))
-                        break
+                submisstions_with_feedback = [x for x in submissions if x['has_local_feedback']]
+                last_feedback = submisstions_with_feedback[-1] if len(submisstions_with_feedback) > 0 else None
+                if last_feedback is not None:
+                    html_files = glob.glob(os.path.join(last_feedback['local_feedback_path'], '*.html'))
+                    
+                    for html_file in html_files:
+                        html_data = open(html_file, 'r').read()
+                        
+                        score_from_html, max_score_from_html = get_score(html_data)
+                        
+                        if score_from_html is not None and max_score_from_html is not None:
+                            score += score_from_html
+                            max_score += max_score_from_html
+                            has_score = True
 
                 info = {
                     'course_id': key[0],
                     'student_id': key[1],
                     'assignment_id': key[2],
                     'status': submissions[0]['status'],
-                    'score': score,
-                    'max_score': max_score,
+                    'score': score if has_score else None,
+                    'max_score': max_score if has_score else None,
                     'submissions': submissions
                 }
                 assignment_submissions.append(info)
