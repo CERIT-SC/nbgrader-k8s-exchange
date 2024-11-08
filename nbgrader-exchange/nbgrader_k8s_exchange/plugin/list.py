@@ -6,12 +6,22 @@ import hashlib
 
 from nbgrader.exchange.abc import ExchangeList as ABCExchangeList
 from nbgrader.utils import notebook_hash, make_unique_key
+
+from lxml import html
+
 from .exchange import Exchange
 
 def _checksum(path):
     m = hashlib.md5()
     m.update(open(path, 'rb').read())
     return m.hexdigest()
+
+def get_meta_value(html_data, key):
+    document = html.fromstring(html_data)
+    meta_content = document.xpath(f'//meta[@name="nbgrader-{key}"]/@content')
+    if meta_content:
+        return meta_content[0]
+    return None
 
 
 class ExchangeList(ABCExchangeList, Exchange):
@@ -193,11 +203,35 @@ class ExchangeList(ABCExchangeList, Exchange):
             for key in assignment_keys:
                 submissions = [x for x in assignments if _match_key(x, key)]
                 submissions = sorted(submissions, key=lambda x: x['timestamp'])
+                
+                has_score = False
+                score, max_score = 0, 0
+                submisstions_with_feedback = [x for x in submissions if x['has_local_feedback']]
+                last_feedback = submisstions_with_feedback[-1] if len(submisstions_with_feedback) > 0 else None
+                if last_feedback is not None:
+                    html_files = glob.glob(os.path.join(last_feedback['local_feedback_path'], '*.html'))
+                    
+                    for html_file in html_files:
+                        html_data = open(html_file, 'r').read()
+                        
+                        score_meta = get_meta_value(html_data, 'score')
+                        max_score_meta = get_meta_value(html_data, 'max-score')
+                        
+                        score_meta = float(score_meta) if score_meta is not None else None
+                        max_score_meta = float(max_score_meta) if max_score_meta is not None else None
+                        
+                        if score_meta is not None and max_score_meta is not None:
+                            score += score_meta
+                            max_score += max_score_meta
+                            has_score = True
+
                 info = {
                     'course_id': key[0],
                     'student_id': key[1],
                     'assignment_id': key[2],
                     'status': submissions[0]['status'],
+                    'score': score if has_score else None,
+                    'max_score': max_score if has_score else None,
                     'submissions': submissions
                 }
                 assignment_submissions.append(info)
